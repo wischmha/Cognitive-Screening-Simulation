@@ -1,0 +1,315 @@
+---
+title:  "Cognitive Screening: Target Population (A1)"
+author: "Hans-Aloys Wischmann and Marco Piccininni"
+date:   "Edited: 2023-12-01 / Executed: `r Sys.Date()`"
+output: word_document
+papersize: a4
+---
+
+```{r setup, include=FALSE}
+  # source parameters and utilities
+  source("./A0_Params_Init.R")
+```
+
+```{r document_params}
+  document_params()
+```
+
+## Required for the Model (Population)
+
+Key properties of the population:
+
+  * Distribution by age and sex: P(age,sex)
+  
+  * Distribution of years of education by age and sex: P(edu|age,sex)
+  
+  * Prevalence of MCI and of dementia by age and education P(MCI/dementia|age,edu)
+
+## Preprocess Population: P(age,sex)
+
+The target population consists of the residents of Italy per January 1st, `r pop_census + 1`, from `r pop_age_min` to `r pop_age_max` years of age, as provided by the official data for the distribution by age and gender from the statistics office:
+
+Istituto Nazionale Di Statistica. Resident population on 1st January 2023 [Available from: http://dati.istat.it/Index.aspx?QueryId=42869]
+
+```{r preprocess_population}
+  # load the raw data file, downloaded from data.istat.it, plot synopsis
+  italy_pop <- read.csv("../Downloads/DCIS_POPRES1_26042023161538262.csv") %>%
+    filter(Territorio == "Italia", ETA1 != "TOTAL", Sesso != "totale", Stato.civile == "totale") %>%
+    select(age = ETA1, sex = Sesso, pop = Value) %>%
+    mutate(age = as.integer(str_replace_all(age, c("Y" = "", "_GE" = ""))),
+           sex = str_sub(sex, 1, 1), yob = pop_census - age) %>%
+    group_by(sex, age) %>% reframe(pop = sum(pop), yob = as.integer(mean(yob)))
+
+  # visualize population and target population
+  italy_pop_plot <- italy_pop %>%
+    mutate(pop = ifelse(sex == "m", -pop / 1000, pop / 1000), Sex = factor(sex, levels = c("m", "f"))) %>%
+    mutate(tgt = pop * (age >= pop_age_min & age <= pop_age_max)) %>%
+    ggplot(aes(x = age, fill = Sex)) +
+      geom_bar(aes(y = pop), stat = "identity", alpha = 0.3) +
+      geom_bar(aes(y = tgt), stat = "identity", alpha = 1.0) +
+      coord_flip() + theme(legend.position = "top") +
+      labs(title = sprintf("eFigure e1: Resident Population in Italy per Jan 1st, %d", pop_census + 1),
+           x = "Age [years] (0 represents <1, 100 represents 100+)",
+           y = "Transparent: Resident Population [1000s], Solid: Target Population [1000s]") +
+    scale_y_continuous(labels = abs)
+  plot_pdf(italy_pop_plot, "../Plots/Italy_Pop_2023.pdf", width = 7, height = 5)
+```
+
+## Preprocess Education: P(edu|age,sex) via P(edu|yob,sex)
+
+The proportions of this population that completed different levels of education are reported in the Annuario Statistico Italiano (ASI) by age group and by sex:
+
+Istituto Nazionale Di Statistica. Annuario Statistico Italiano 1998-2021 [Available from: https://www.istat.it/storage/ASI/2021/ASI_2021.pdf]
+
+However, these proportions change over time, driven by modifications to policies and to the education system, as well as other socio-economic influence factors: In a study executed at a particular moment in time, education depends on age, but the underlying dependency is on year of birth. From each ASI report, data on completed education for the groups from 30 to 64 years of age is extracted, as younger people may not yet have completed their education, while the 65+ group integrates over too much of the target population. After converting to year of birth, these cohorts are followed across the annual reports from 1998 to 2021.
+
+Primary school (or less) is equated with 5 years of education, middle school with 8, vocational qualification with 11, secondary education with 13, and university education with 17, consistent with the number of school years in the education system in Italy and with the mean values calculated across individual subjects tabulated in:
+
+Aiello EN, Gramegna C, Esposito A, Gazzaniga V, Zago S, Difonzo T, et al. The Montreal Cognitive Assessment (MoCA): updated norms and psychometric insights into adaptive testing from healthy individuals in Northern Italy. Aging Clin Exp Res. 2022;34(2):375-82.
+
+NB: ASI 1998 and 1999 report university education in two separate categories, i.e., "Dottorato e laurea" and "Dimploma universitario", which have been combined to harmonize with the categories used between 2000 and 2021. All annual statistical reports prior to 1998 provide only data for primary (or less), middle, and secondary (or more), but do not provide university education nor vocational training proportions, and ASI 2022 switches to "Titolo terziario", "Titolo secondario superiore", "Al più un titolo secondario inferiore", which removes differentiation that is essential in the older population. Therefore, ASI reports from 1998 to 2021 are used.
+
+```{r preprocess_education_1}
+  # education in years for each education level (from the official reports, depends on education system)
+  edu_equate <- c("edu_ele" = "5", "edu_mid" = "8", "edu_voc" = "11", "edu_sec" = "13", "edu_uni" = "17")
+
+  # read extracted info (pop in 1k by education category), convert education to years, select age range
+  italy_edu_age_sex <- load_csv("../Downloads/ASI_1998_2021.csv") %>%
+    mutate(total = edu_uni + edu_sec + edu_voc + edu_mid + edu_ele) %>%    # compute totals
+    mutate(across(starts_with("edu_"), ~round(100.0 * .x / total, 1))) %>% # convert to proportion in percent
+    filter(age_from >= edu_age_min, age_to <= edu_age_max) %>%             # exclude youngest and oldest
+    mutate(age = as.integer(round(0.5 * (age_from + age_to), 0))) %>%      # compute age midpoint
+    select(year, age, age_from, age_to, sex, starts_with("edu_")) %>%
+    pivot_longer(starts_with("edu_"), names_to = "edu", values_to = "prop") %>%
+    mutate(edu = as.integer(str_replace_all(edu, edu_equate))) %>%         # equate education years
+    mutate(edu = factor(edu, levels = c("17", "13", "11", "8", "5")), sex = factor(sex, levels = c("m", "f")))
+
+  # visualize education by age and sex
+  italy_edu_age_sex_plot <- italy_edu_age_sex %>%
+    mutate(labels = ifelse((age_from == max(age_from)) & (edu == "5") & (year %% 4 == 1), as.character(year), "")) %>%
+    ggplot(aes(x = age, y = prop, group_by = interaction(year, edu), color = edu)) +
+      geom_line(linewidth = 0.5) +
+      geom_point() +
+      geom_text(aes(x = max(age), label = labels, hjust = -0.5), show.legend = FALSE) +
+      facet_wrap(~sex) +
+      xlim(c(edu_age_min, edu_age_max + 5)) +
+      labs(title = "eFigure e3: Completed Education by Age (ASI 1998-2021)", color = "Edu [years]",
+           x = "Age (Midpoint) [years]", y = "Proportion [%]") +
+    theme(legend.position = "top")
+  plot_pdf(italy_edu_age_sex_plot, "../Plots/Italy_Edu_Age_Sex.pdf", width = 7, height = 5)
+```
+
+Each line in eFigure e3 corresponds to one of the education levels in one the annual statistical reports (ASI) from the years 1998 to 2021, which provide data per the middle of the previous year, shown in the labels and used to calculate the year of birth in the following. Note that the ASI 2001 contained the same information as the ASI 2000 (proportions per mid-year 1999), so that the duplicate data was excluded, and data per mid-2000 are not available. A strong dependency on age and differences between men and women are visible, and it is obvious that the curves shift over time.
+
+```{r preprocess_education_2}
+  # convert to year-of-birth
+  italy_edu_yob_sex <- italy_edu_age_sex %>%
+    mutate(yob = year - age) %>%
+    select(sex, edu, yob, prop, year)
+
+  # visualize education by year of birth and sex
+  italy_edu_yob_sex_plot <- italy_edu_yob_sex %>%
+    ggplot(aes(x = yob, y = prop, group_by = interaction(year, edu), color = edu)) +
+      geom_line(linewidth = 0.5) +
+      geom_point() +
+      xlim(c(1935, 1990)) +
+      labs(title = "eFigure e4: Completed Education by Year of Birth (ASI 1998-2021)", color = "Edu  [years]",
+           x = "Year of Birth (Midpoint)", y = "Proportion [%]") +
+      facet_wrap(~sex) + theme(legend.position = "top")
+  plot_pdf(italy_edu_yob_sex_plot, "../Plots/Italy_Edu_YOB_Sex.pdf", width = 7, height = 7)
+```
+
+Each line in eFigure e4 again corresponds to one of the education levels in one of the annual statistical reports from the years 1998 to 2021. The dependency on time, i.e., on the year of the annual report has been eliminated: The most relevant predictors of education are year of birth and sex.
+
+```{r preprocess_education_3}
+  # use all available yob data points from all ASI reports, aggregate using loess, medium span parameter
+  italy_mean_edu_yob_sex <- italy_edu_yob_sex %>%
+    group_by(sex, edu) %>%
+    reframe(x = pop_yob_min:pop_yob_max,
+            y = predict(loess(prop ~ yob, span = 0.5, control = loess.control(surface = "direct")),
+                        newdata = data.frame(yob = pop_yob_min:pop_yob_max))) %>%
+    select(sex, edu, yob = x, prop = y)
+  
+  # visualize mean education by year of birth and sex
+  italy_mean_edu_yob_sex_plot <- italy_mean_edu_yob_sex %>%
+    ggplot(aes(x = yob, y = prop, group_by = edu, color = edu)) +
+      geom_point(data = italy_edu_yob_sex) +
+      geom_line(linewidth = 0.5, color = "black") +
+      xlim(c(pop_yob_min, 1990)) +
+      labs(title = "eFigure e2: Completed Education by Year of Birth and Sex (Black: Model)",
+           x = "Year of Birth", y = "Proportion [%]", color = "Education [years]") +
+      facet_wrap(~sex) + theme(legend.position = "top")
+  plot_pdf(italy_mean_edu_yob_sex_plot, "../Plots/Italy_Edu_Model.pdf", width = 7, height = 5)
+```
+
+The black lines in eFigure e2 show the proportions of the population that completed the different levels of education, by sex and by year of birth, aggregated across all available data points from all publication years using local regression (loess), for the age range of interest, i.e., `r pop_age_min` to `r pop_age_max` years of age. The overlay with all available data points shows that the dependency of education levels on year of birth and sex is captured well.
+
+```{r combine_population_education}
+  target_pop_age_sex_edu <- italy_mean_edu_yob_sex %>%
+    pivot_wider(values_from = prop, names_from = edu, names_prefix = "pct_edu_") %>%
+    left_join(italy_pop, ., by = c("sex", "yob")) %>%                               # combine population, education
+    select(sex, age, pop, starts_with("pct")) %>% drop_na() %>%                     # omit age ranges not in target population
+    mutate(across(starts_with("pct_"), ~as.integer(round(. * 0.01 * pop, 0)))) %>%  # convert frequencies to population counts
+    select(!pop) %>% pivot_longer(starts_with("pct_"), names_to = "edu", values_to = "pop") %>%
+    mutate(edu = str_replace(edu, "pct_edu_", ""))
+```
+
+\newpage
+
+## Prevalence of Dementia and MCI by Age, by Education, and by Sex, P(dementia|age,edu,sex) and P(MCI|age,edu,sex)
+
+Data reported in a population-based study in northern Italy is used to model the prevalence of dementia and MCI by age, education, and sex:
+
+De Ronchi D, Berardi D, Menchetti M, Ferrari G, Serretti A, Dalmonte E, et al. Occurrence of cognitive impairment and dementia after the age of 60: a population-based study from Northern Italy. Dement Geriatr Cogn Disord. 2005;19(2-3):97-105
+
+A separate Poisson regression is performed for dementia and for MCI, using age, education level, and sex as the independent variables.
+
+The fitted regressions are used to model the prevalence in the target population by age, education level, and sex. The resulting prevalence values are scaled up by a constant factor of 2.0 for dementia, so that the marginal prevalence by age and sex matches recent data from Europe, and scaled up by a constant factor of 6.0 for MCI so that the marginal prevalence by age matches recent data:
+
+Alzheimer Europe. Dementia in Europe Yearbook 2019 2019 [Available from: https://www.alzheimer-europe.org/sites/default/files/alzheimer_europe_dementia_in_europe_yearbook_2019.pdf]
+
+Petersen RC, Lopez O, Armstrong MJ, Getchius TSD, Ganguli M, Gloss D, et al. Practice guideline update summary: Mild cognitive impairment: Report of the Guideline Development, Dissemination, and Implementation Subcommittee of the American Academy of Neurology. Neurology. 2018;90(3):126-35.
+
+```{r prevalence_DEM_MCI}
+  # scale factors for prevalence
+  scale_dem <- 2.0
+  scale_mci <- 6.0
+
+  # Alzheimer Europe 2019 (dementia prevalence, ages 60-90, by sex)
+  prevalence_dem_age <- data.frame(sex = c(rep("f", 7), rep("m", 7)),
+                                   age_from = rep(seq(55, 85, 5), 2), age_to = rep(seq(59, 89, 5), 2), 
+                                   dem_pct_eu = c(NA, 0.9, 1.5, 3.4, 8.9, 13.1, 24.9,
+                                                  NA, 0.2, 1.1, 3.1, 7.0, 10.7, 16.3))
+
+  # Petersen US (MCI prevalence, ages 60-84)
+  prevalence_mci_age <- data.frame(age_from = seq(55, 85, 5), age_to = seq(59, 89, 5),
+                                   mci_pct_us = c(NA, 6.7, 8.4, 10.1, 14.8, 25.2, NA))
+
+  # categorize education in years into levels
+  # De Ronchi: 0(0), 1..3(3), 4..5(5), 6+(8), equate to levels 0 = "none/less than primary", 1 = "primary", 2 = "(some) middle school"
+  # target population:: 1 = primary(5), 2 = middle(8), 3 = vocational(11)/secondary(13), 4 = tertiary(17)
+  edu_level <- function(edu_years) {
+    return((edu_years >= 5) + (edu_years >= 8) + (edu_years >= 11) + (edu_years >= 17))
+  }
+  
+  # read tables extracted from De Ronchi, convert to prevalence for dementia and MCI(CIND), count education levels
+  deronchi_data <- load_csv("../Extracted/DeRonchi.csv") %>%
+    pivot_longer(starts_with("edu"), names_to = "edu", values_to = "count") %>%
+    pivot_wider(names_from = "status", values_from = "count") %>%
+    mutate(edu = as.integer(str_sub(edu, -1, -1)), sex = fct_inorder(sex), age = age_from + 2) %>%
+    select(age, edu, sex, pop, dem, mci = cind) %>%
+    mutate(edu_level = edu_level(edu)) %>%
+    group_by(age, edu_level, sex) %>%
+    reframe(pop = sum(pop), dem = sum(dem), mci = sum(mci))
+  
+  # fit poisson regression models for dementia and for MCI
+  dem_model <- glm(dem ~ offset(log(pop)) + age + edu_level + sex, family = poisson, data = deronchi_data)
+  mci_model <- glm(mci ~ offset(log(pop)) + age + edu_level + sex, family = poisson, data = deronchi_data)
+  print(summary(dem_model))
+  print(summary(mci_model))
+  DEM <- round(exp(dem_model$coefficients), 3)
+  CI_DEM <- round(exp(confint(dem_model)), 3)
+  MCI <- round(exp(mci_model$coefficients), 3)
+  CI_MCI <- round(exp(confint(mci_model)), 3)
+  data.frame(DEM, DL = CI_DEM[,1], DU = CI_DEM[,2], MCI, ML = CI_MCI[,1], MU = CI_MCI[,2])[-1,] %>%
+    mutate(Coefficient = rownames(.),
+           RR_Dementia = sprintf("%.3f [%.3f,%.3f]", DEM, DL, DU),
+           RR_MCI      = sprintf("%.3f [%.3f,%.3f]", MCI, ML, MU)) %>%
+    select(Coefficient, RR_Dementia, RR_MCI) %>%
+    flextable() %>%
+    set_caption(., caption = "Table e1: Risk Ratios from Regression Fits") %>%
+    align(., i = NULL, j = 2:3, align = "center", part = "all") %>%
+    width(., j = NULL, width = 1.5, unit = "in")
+  
+  # assess risk factor for increase by one age category, i.e., by 5 additional years of age
+  print(sprintf("RR_DEM for +5 years of age: %.2f", exp(5.0 * dem_model$coefficients["age"])))
+  print(sprintf("RR_MCI for +5 years of age: %.2f", exp(5.0 * mci_model$coefficients["age"])))
+
+  # calibration plot
+  deronchi_calibration_plot <- deronchi_data %>%
+    mutate(dem_pop = round(predict(dem_model, newdata = ., type = "response"), 0),
+           mci_pop = round(predict(mci_model, newdata = ., type = "response"), 0)) %>%
+    ggplot() +
+      geom_point(aes(x = dem, y = dem_pop), color = "red") +
+      geom_point(aes(x = mci, y = mci_pop), color = "blue") +
+      geom_smooth(aes(x = dem, y = dem_pop), formula = "y  ~ x", method = "lm", color = "red") +
+      geom_smooth(aes(x = mci, y = mci_pop), formula = "y  ~ x", method = "lm", color = "blue") +
+      geom_abline(slope = 1.0, intercept = 0.0, color = "black") +
+      labs(x = "Actual # Dementia / # MCI", y = "Predicted # Dementia / # MCI",
+           title = "eFigure e5: Model Calibration: Dementia (Red), MCI (Blue)")
+  plot_pdf(deronchi_calibration_plot, file = "../Plots/DeRonchi_Calibration.pdf")
+
+  # predict number of dementia and MCI patients by sex, age, edu in target population, scaling to match reported marginal prevalence
+  target_pop_age_sex_edu_prev_dem_mci <- target_pop_age_sex_edu %>%
+    mutate(edu = as.integer(edu)) %>%
+    mutate(edu_level = edu_level(edu)) %>%
+    mutate(dem_pop = round(scale_dem * predict(dem_model, newdata = ., type = "response"), 0), # scale to match marginal prevalence
+           mci_pop = round(scale_mci * predict(mci_model, newdata = ., type = "response"), 0)) # scale to match marginal prevalence
+
+  # verify marginal distribution for dementia by sex and by age, integrating over education by age and sex, compare to [Alz.EU.2019]
+  target_pop_age_sex_edu_prev_dem_mci %>%
+    left_join(., prevalence_dem_age, join_by("sex" == "sex", "age" >= "age_from", "age" <= "age_to")) %>%
+    group_by(sex, age_from, age_to, dem_pct_eu) %>% reframe(dem_pct = round(100.0 * sum(dem_pop) / sum(pop), 1)) %>%
+    mutate(diff = dem_pct - dem_pct_eu, age = sprintf("%d-%d", age_from, age_to)) %>%
+    select(Sex = sex, Age = age, Model = dem_pct, Europe = dem_pct_eu, Difference = diff) %>%
+    flextable() %>%
+      set_caption(., caption = "Table e3: Marginal Prevalence of Dementia by Sex and Age Group") %>%
+      add_header_row(., colwidths = c(1, 1, 3), values = c("Sex", "Age", "Prevalence [%]")) %>%
+      align(., i = NULL, j = NULL, align = "center", part = "all") %>%
+      merge_at(., i = 1:2, j = 1, part = "header") %>% merge_at(., i = 1:2, j = 2, part = "header") %>% width(., width = 1.0)
+  
+  # verify marginal distribution by age, integrating over education by age and sex, and sex by age, compare to [Alz.Assoc.2022]
+  target_pop_age_sex_edu_prev_dem_mci %>%
+    left_join(., prevalence_mci_age, join_by("age" >= "age_from", "age" <= "age_to")) %>%
+    group_by(age_from, age_to, mci_pct_us) %>% reframe(mci_pct = round(100.0 * sum(mci_pop) / sum(pop), 1)) %>%
+    mutate(diff = mci_pct - mci_pct_us, age = sprintf("%d-%d", age_from, age_to)) %>%
+    select(Age = age, Model = mci_pct, US = mci_pct_us, Difference = diff) %>%
+    flextable() %>%
+      set_caption(., caption = "Table e2: Marginal Prevalence of MCI by Age") %>%
+      add_header_row(., colwidths = c(1, 3), values = c("Age", "Prevalence [%]")) %>%
+      align(., i = NULL, j = NULL, align = "center", part = "all") %>%
+      merge_at(., i = 1:2, j = 1, part = "header") %>% width(., width = 1.0)
+```
+
+## Table 1
+
+```{r table1}
+  # merge prevalence tables
+  target_pop_age_sex_edu_disease <- target_pop_age_sex_edu_prev_dem_mci %>%
+    mutate(healthy = pop - mci_pop - dem_pop) %>%
+    select(sex, age, edu, healthy, mci = mci_pop, dementia = dem_pop)
+  save_csv(target_pop_age_sex_edu_disease, file = "../Processed/Italy_Pop_Age_Sex_Edu_Disease.csv")
+
+  # aggregate by 5 year age groups and convert to probabilities
+  pop_total = sum(target_pop_age_sex_edu_disease$healthy) + sum(target_pop_age_sex_edu_disease$mci) + sum(target_pop_age_sex_edu_disease$dementia)
+  pop_scale_percent = 100.0 / pop_total
+  target_pop_age_sex_edu_disease_prob <- target_pop_age_sex_edu_disease %>%
+    mutate(age_group = cut(age, seq(pop_age_min - 1, pop_age_max, 5))) %>%
+    group_by(sex, edu, age_group) %>%
+    reframe(age_from = min(age), age_to = max(age), healthy = sum(healthy), mci = sum(mci), dementia = sum(dementia)) %>%
+    mutate(across(c("healthy", "mci", "dementia"), ~round(pop_scale_percent * .x, 3)))
+  save_csv(target_pop_age_sex_edu_disease_prob, file = "../Processed/Italy_Pop_Age_Sex_Edu_Disease_Prob.csv")
+
+  # create summary for table 1
+  table1 <- target_pop_age_sex_edu_disease_prob %>%
+    mutate(age_range = sprintf("%d-%d", age_from, age_to)) %>%
+    select(sex, age_range, edu, healthy, mci, dementia) %>%
+    pivot_wider(names_from = edu, values_from = c(healthy, mci, dementia)) %>%
+    select(sex, age_range, ends_with("5"), ends_with("8"), ends_with("11"), ends_with("13"), ends_with("17")) %>%
+    arrange(sex, age_range)
+  table1 %>%
+    flextable() %>%
+      set_caption(., caption = "Table 1: Population in % by Sex, Age Group, Education, Status (Not Cong. Imp. / MCI / Dementia)") %>%
+      add_header_row(., colwidths = c(1, 1, rep(3, 5)), values = c("Sex", "Age", "5 years", "8 years", "11 years", "13 years", "17 years")) %>%
+      add_header_row(., colwidths = c(1, 1, 15), values = c("Sex", "Age", "Completed Education")) %>%
+      set_header_labels(., values = c("Sex", "Age", rep(c("Healthy", "MCI", "DEM"), 5))) %>%
+      hline(., i =  7, j = NULL, part = "body") %>%
+      merge_at(., i = 1:3, j = 1, part = "header") %>% merge_at(., i = 1:3, j = 2, part = "header") %>%
+      align(., align = "center", part = "all") %>%
+      autofit(.)
+
+  # verify that the total adds up to 100%
+  table1_total <- table1 %>% reframe(across(where(is.double), ~sum(.)))  %>% rowSums()
+  print(sprintf("Sum of entries in Table 1: %.3f %%", table1_total))
+```
+

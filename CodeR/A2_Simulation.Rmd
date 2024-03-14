@@ -1,0 +1,375 @@
+---
+title:  "Cognitive Screening: Simulation (A2)"
+author: "Hans-Aloys Wischmann and Marco Piccininni"
+date:   "Edited: 2024-03-14 / Executed: `r Sys.Date()`"
+output: word_document
+papersize: a4
+---
+
+```{r setup, include=FALSE}
+  # source parameters and utilities
+  source("./A0_Params_Init.R")
+
+  # choose whether to round raw MoCA scores to the nearest integer and to clip to the allowed range [0:30]
+  enable_round_clip <- FALSE
+```
+
+```{r document_params_published_regresssions}
+  print(paste("Raw MoCA scores are rounded and clipped:", enable_round_clip))
+  document_params()
+  # immutable published coefficients
+  published_regressions <- data.frame(
+    model_name = c("Santangelo", "Conti", "Aiello"),
+    intercept  = c(21.98,   23.28,  24.17),
+    age_coeff  = c( 4.228,  -0.175, -0.000008),
+    age_offset = c( 1.58,   70.080, 297697.184801),
+    edu_coeff  = c( 3.201, -24.300, 3.331407),
+    edu_offset = c( 3.25,    0.126, 2.325648))
+  row.names(published_regressions) <- published_regressions$model_name
+  published_regressions %>%
+    flextable() %>% set_caption(., "eTable e1: Published Regressions") %>% autofit(.)
+  citation("pROC")
+```
+
+## Prerequisites: Target Population
+
+The target population distribution needs to be provided in a file "Italy_Pop_Age_Sex_Disease_Prob.csv" with columns separated by ";", including the variables sex (character "m" or "f"), edu (integer >= 1 [years]), age_group (character = "age_from-age_to"), age_from (integer >= 0, <= 99 [years]), age_to (integer >= 0, <= 99 [years]), healthy (double >= 0.0, <= 100.0), mci (double >= 0.0, <= 100.0), dementia (double >= 0.0, <= 100.0). For each disease status, i.e., the columns healthy, mci, and dementia, the value indicates the proportion of the population that falls into the bucket defined by sex, age_group, edu, and the disease status. The total sum across all observation rows for these disease status columns should be equal to 100.0 (up to rounding errors).
+
+```{r local_utilities}
+  # helper function: compare predicted(TRUE/FALSE) to actual(TRUE/FALSE) to determine label (tp, fp, fn, tn)
+  is_tp_tn_fp_fn <- function(predicted, actual) {
+    return(ifelse(predicted, ifelse(actual, "tp", "fp"), ifelse(actual, "fn", "tn")))
+  }
+
+  # helper function: compute sensitivity, returns NaN when no positives (tp + fn == 0) 
+  sens <- function(tp_tn_fp_fn) {
+    tp <- sum(tp_tn_fp_fn == "tp")
+    fn <- sum(tp_tn_fp_fn == "fn")
+    return(tp / (tp + fn))
+  }
+
+  # helper function: compute specificity, returns NaN when no negatives (tn + fp == 0) 
+  spec <- function(tp_tn_fp_fn) {
+    tn <- sum(tp_tn_fp_fn == "tn")
+    fp <- sum(tp_tn_fp_fn == "fp")
+    return(tn / (tn + fp))
+  }
+
+  # helper function to pretty print AUC tables for all models (add results = "asis" and flextable_to_rmd() to print from within loops)
+  pretty_print_auc <- function(auc, model, n_runs) {
+    auc_replace <- c("_CI_H" = "(MCI or Dem.) vs. Healthy", "_MCI_H" = "MCI vs. Healthy", "_DEM_H" = "Dementia vs. Healthy")
+    auc_print   <- auc %>% select(Scores, starts_with(model))
+    colnames(auc_print) <- colnames(auc_print) %>% gsub(model, "", .) %>% str_replace_all(., auc_replace)
+    auc_print %>% flextable() %>%
+      set_caption(., caption = sprintf("Table X: AUC (Model = %s, Validation Samples, %d Simulations)", model, n_runs)) %>%
+      align(., j = 2:4, align = "left", part = "all") %>%
+      autofit(.)
+  }
+
+  # helper function to pretty print sens/spec (total and dispersion) tables for all models
+  pretty_print_sens_spec <- function(print_table, model, n_runs) {
+    print_table %>%
+      select(c("age_group", "edu", paste(c("sens_raw_", "spec_raw_", "sens_cor_", "spec_cor_"), model, sep = ""), "cutoff")) %>%
+      flextable() %>%
+        set_caption(., caption = sprintf("Table X: Sens/Spec, Total and Range by Age/Edu (%s, Validation, %d Simulations)", model, n_runs)) %>%
+        set_header_labels(., values = c("Age", "Edu", "Sensitivity [%]", "Specificity [%]", "Sensitivity [%]", "Specificity [%]", "cutoff")) %>%
+        add_header_row(., values = c("", "", "Raw", "Corrected", ""), colwidths = c(1, 1, 2, 2, 1)) %>%
+        align(., j = 1:4, align = "center", part = "all") %>% hline(., i = seq(3, 7, 2), part = "body") %>%
+        merge_at(., i =  1:3, j = 1, part = "body") %>%
+        merge_at(., i =  1:3, j = 2, part = "body") %>%
+        merge_at(., i =  4:5, j = 7, part = "body") %>%
+        merge_at(., i =  6:7, j = 7, part = "body") %>%
+        merge_at(., i =  8:9, j = 7, part = "body") %>%
+        autofit(.)
+  }
+```
+
+## Simulation Setup: Infinite Target Population
+
+The infinite target population mimics the resident population in Italy, per January 1st, 2023, in the range from 55 to 89 years of age, as defined by realistic proportions by sex, age, education, and health status, the latter defined as exactly one of healthy, MCI, or dementia.
+
+```{r target_population_load}
+  # reload target population (in %), compute share of mci patients among ci patients
+  target_pop <- load_csv("../Processed/Italy_Pop_Age_Sex_Edu_Disease_Prob.csv")
+  w_mci <- sum(target_pop$mci) / (sum(target_pop$mci) + sum(target_pop$dem))
+
+  # convert target population to tidy table, compute cumulative proportion in the range from 0 to 1, scale max to exactly 1.0
+  scale = 1.0 / sum(target_pop$healthy + target_pop$mci + target_pop$dementia)
+  target_pop_prob <- target_pop %>%
+    pivot_longer(c("healthy", "mci", "dementia"), names_to = "status", values_to = "prob") %>%
+    mutate(cum_prob = scale * cumsum(prob)) %>% select(!prob)
+
+  # compute fraction of healthy individuals and fraction of MCI patients within each age-education group (excluding dementia)
+  pop_healthy_mci <- target_pop %>% group_by(age_group, edu) %>%
+    reframe(across(c(healthy, mci), ~sum(.x))) %>%
+    mutate(healthy = 100.0 * healthy / sum(healthy), mci = 100.0 * mci / sum(mci))
+
+  # function to create a random sample of size n_sample
+  create_random_sample <- function(table_cum_prob, n_sample) {
+    # array of uniform random numbers in the range of [0,1)
+    runif_values <- runif(n_sample)
+    # index of first row where cumulative probability is larget than or equal to random number
+    table_indices <- map_int(runif_values, ~first(which(table_cum_prob$cum_prob >= .x)))
+    # read sex, edu, and status from first indexed observations
+    random_sample <- table_cum_prob[table_indices,] %>%
+      # generate random age withing  [age_from, age_to +1)
+      mutate(age = age_from + runif(nrow(.) * (age_to + 0.99 - age_from))) %>%
+      select(sex, edu, age, age_group, status) %>%
+      # append characterizations
+      mutate(healthy = status == "healthy", mci = status == "mci", dem = status == "dementia", ci = mci | dem)
+    return(random_sample)
+  }
+```
+
+## Simulation Setup: Modeling MoCA Scores
+
+We model the raw MoCA test score of healthy indivitualss using three different regressions that were published in recent normative studies in Italy [Aiello, 2021], [Conti, 2015], and [Santangelo, 2015]. Within each simulation run, each of these regression functions is used to compute one score for every indivituals in the development sample and in the validation sample.
+
+For patients with MCI or dementia, these “healthy” MoCA scores are shifted by `r score_offset_mci` and `r score_offset_dem` points, respectively, where the offset values are the averages of a) the differences -5.333 ± 0.531 and -12.278 ± 0.592 between mean MoCA raw scores in a study in Portugal whose sub-groups were matched on age and education [Freitas, 2013], b) coefficients of -4.07 ± 0.63 and -9.66 ± 0.84 from a US study [Hong, 2022], and c) coefficients of -5.769 ± 0.696 and -10.147 ± 0.688 from a study in Hong Kong [Yeung, 2014], where the combined regression models in b) and c) included age and education in addition to status and other independent variables. For every indivituals, a normally distributed offset is added, with a mean of 0 and a standard deviation of 2.9, consistent with the standard deviation of the residuals in (2). If enable_round_clip is set to TRUE, the resulting raw MoCA scores are rounded to the nearest integer and clipped to the possible range of test scores, i.e., [0,30] points.
+
+```{r forward_modeling_published_regressions}
+  # for each regression model, compute and append MoCA score for each indivituals to a population data frame
+  append_moca_scores <- function(population) {
+    # immutable limits for the cognition test
+    test_min_score <-  0
+    test_max_score <- 30
+    # compute scores
+    population_with_scores <- population %>%
+      # indivituals-specific offset based on status (mci or dementia) plus a random deviation
+      mutate(offset = score_offset_mci * mci + score_offset_dem * dem + rnorm(nrow(.), mean = 0.0, sd = score_individual_SD)) %>%
+      # 2015, Santangelo, n = 415, <MoCA> = 21.98 (raw), <age> = 56.82 years, <edu> = 11.13 years, mean(SD within age/edu box) ~2.9
+      mutate(scores_raw_Santangelo =
+        published_regressions["Santangelo", "intercept"] +
+        published_regressions["Santangelo", "age_coeff"] * (log10(100.0 - age) - published_regressions["Santangelo", "age_offset"]) +
+        published_regressions["Santangelo", "edu_coeff"] * (sqrt(edu)          - published_regressions["Santangelo", "edu_offset"])) %>%
+      # 2015, Conti, n = 225, <MoCA> = 23.28 (raw), <age> = 70.08 years, <edu> = 9.9 years, mean(SD within age/edu box) = 2.3
+      mutate(scores_raw_Conti =
+        published_regressions["Conti", "intercept"] +
+        published_regressions["Conti", "age_coeff"] * (age     - published_regressions["Conti", "age_offset"]) +
+        published_regressions["Conti", "edu_coeff"] * ((1/edu) - published_regressions["Conti", "edu_offset"])) %>%
+      # 2021, Aiello, n = 535, <MoCA> = 24.17 (raw), <age> = 63.44 years, <edu> = 11.27 years, SD(residuals) = 2.9
+      mutate(scores_raw_Aiello =
+        published_regressions["Aiello", "intercept"] +
+        published_regressions["Aiello", "age_coeff"] * ((age * age * age) - published_regressions["Aiello", "age_offset"]) +
+        published_regressions["Aiello", "edu_coeff"] * (log(edu)          - published_regressions["Aiello", "edu_offset"])) %>%
+      # add offset per indivituals, remove offset column
+      mutate(across(starts_with("scores_raw_"), ~.x + offset)) %>% select(!offset)
+    # round scores to nearest integer and clip to possible range (to reflect test reality)
+    if(enable_round_clip) {
+      return(population_with_scores %>% mutate(across(starts_with("scores_raw_"), ~pmin(test_max_score, pmax(test_min_score, round(.x, 0))))))
+    } else {
+      return(population_with_scores)
+    }
+  }
+```
+
+## Function to Correct Scores for Age and Education
+
+Each published regression model function is fitted to the healthy subset of each development sample, and the coefficients are used to correct the scores of the development sample (for determining cutoffs) and of the validation sample (for evaluating auc as well as sensitivity and specificity for the cutoffs).
+
+```{r correct_scores_for_age_education}
+  # for each regression model, fit to normative healthy subset of development sample, and use the coefficients to correct all scores
+  correct_scores <- function(df) {
+    development_sample_healthy <- df %>% filter(type == "dev", healthy) %>%
+      mutate(log10_age = log10(100.0 - age), age_3 = age * age * age, sqrt_edu = sqrt(edu), inv_edu = 1.0 / edu, log_edu = log(edu))
+    # fit regression models
+    model_s <- lm(scores_raw_Santangelo ~ log10_age + sqrt_edu, data = development_sample_healthy)
+    model_c <- lm(scores_raw_Conti      ~ age       + inv_edu,  data = development_sample_healthy)
+    model_a <- lm(scores_raw_Aiello     ~ age_3     + log_edu,  data = development_sample_healthy)
+    # compute means to use as offsets in correction, to avoid a shift of the mean
+    mean_age       <- mean(development_sample_healthy$age)
+    mean_age_3     <- mean(development_sample_healthy$age_3)
+    mean_log10_age <- mean(development_sample_healthy$log10_age)
+    mean_sqrt_edu  <- mean(development_sample_healthy$sqrt_edu)
+    mean_inv_edu   <- mean(development_sample_healthy$inv_edu)
+    mean_log_edu   <- mean(development_sample_healthy$log_edu)
+    # correct scores in validation sample using regressions fitted to development sample
+    df_corrected <- df %>%
+      mutate(scores_cor_Santangelo = scores_raw_Santangelo -
+               model_s$coefficients["log10_age"] * (log10(100.0 - age) - mean_log10_age) -
+               model_s$coefficients["sqrt_edu"]  * (sqrt(edu)          - mean_sqrt_edu),
+             scores_cor_Conti = scores_raw_Conti -
+               model_c$coefficients["age"]       * (age                - mean_age) -
+               model_c$coefficients["inv_edu"]   * ((1.0 / edu)        - mean_inv_edu),
+             scores_cor_Aiello = scores_raw_Aiello -
+               model_a$coefficients["age_3"]     * ((age * age * age)  - mean_age_3) -
+               model_a$coefficients["log_edu"]   * (log(edu)           - mean_log_edu))
+    return(df_corrected)
+  }
+```
+
+## Simulations
+
+Perform `r sprintf("%d", n_simulation_runs)` simulation runs, where each run consists of the following steps:
+
+  * Selection of a development sample of `r n_sample_development` persons and of a separate validation sample of `r n_sample_validation` persons, each as random samples from the infinite target population; 
+
+  * Regression fit (for each regression model) of the raw scores of healthy indivitualss in the development sample, and correction of the raw scores for all indivitualss in the validation sample using the fitted coefficients, without any discretization nor clipping;
+
+  * Evaluation of overall discrimination power of the test using the area under the curve (AUC), separately for raw scores and for corrected scores, in the separate validation sample, for each regression model;
+
+  * Evaluation of sensitivity and specificity in the validation sample, separately for raw and for corrected scores, using cutoffs determined in the traditional manner from normative scores, i.e., pre-selected specificity among healthy indivitualss in the development sample, and then using cutoffs determined from the scores of the mci patients, i.e., pre-selected sensitivity among mci patients in the development sample.
+
+AUC values are calculated for distinguishing:
+
+  * Patients with cognitive impairment (MCI or dementia) from healthy indivitualss, across the total validation sample;
+
+  * Patients with MCI from healthy indivitualss, in the absence of patients with dementia;
+
+  * Patients with dementia from healthy indivitualss, in the absence of patients with MCI.
+
+Sensitivity and specificity are calculated (both in total and separately for each age/education box) for distinguishing patients with MCI from healthy indivitualss, in the absence of patients with dementia, as this reflects most closely the clinical setting of screening an asymptomatic population for (new onset) mild cognitive impairment, where the dementia patients will have already been identified and separated.
+
+```{r simulation}
+  # prepare for AUC evaluation: expected (analytic) AUC results for corrected scores (Marco Piccininni)
+  expected_MCI_H <- 1.0 - pnorm(score_offset_mci, sd = sqrt(2.0) * score_individual_SD)
+  expected_DEM_H <- 1.0 - pnorm(score_offset_dem, sd = sqrt(2.0) * score_individual_SD)
+  expected_CI_H  <- expected_MCI_H * w_mci + expected_DEM_H * (1.0 - w_mci)
+  expected_auc   <- data.frame(Scores = "Analytic (Corrected)",
+    Santangelo_CI_H  = expected_CI_H,  Conti_CI_H  = expected_CI_H,  Aiello_CI_H  = expected_CI_H,
+    Santangelo_MCI_H = expected_MCI_H, Conti_MCI_H = expected_MCI_H, Aiello_MCI_H = expected_MCI_H,
+    Santangelo_DEM_H = expected_DEM_H, Conti_DEM_H = expected_DEM_H, Aiello_DEM_H = expected_DEM_H) %>%
+    mutate(across(!Scores, ~sprintf("%.4f", .x)))
+
+  # parallel processing of n_simulation_runs many simulation runs
+  set.seed(314159)
+  simulation_results <- foreach(simulation_run = 1:n_simulation_runs, .combine = "rbind", .packages = c("tidyverse", "pROC")) %dorng% {
+    # create a development sample and a separate validation sample, calculate scores using model (forward)
+    development_sample <- append_moca_scores(create_random_sample(target_pop_prob, n_sample_development)) %>% mutate(type = "dev")
+    validation_sample  <- append_moca_scores(create_random_sample(target_pop_prob, n_sample_validation))  %>% mutate(type = "val")
+    combined_sample    <- rbind(development_sample, validation_sample)
+
+    # perform regression fit on development sample and apply correction to development and validation sample
+    combined_corrected    <- correct_scores(combined_sample) 
+    development_corrected <- combined_corrected %>% filter(type == "dev")
+    validation_corrected  <- combined_corrected %>% filter(type == "val")
+    validation_nondem     <- validation_corrected %>% filter(!dem)
+    validation_nonmci     <- validation_corrected %>% filter(!mci)
+
+    # 1st evaluation: AUC using raw or corrected scores
+    auc_double <- function(...) {return(as.double(auc(..., levels = c("FALSE", "TRUE"),  direction = ">")))}
+    auc <- data.frame(Scores = c("Raw", "Corrected"),
+      # 1a: AUC for CI_H = (MCI or dementia) vs. Healthy (trimodal distribution, complete sample)
+      Santangelo_CI_H  = c(auc_double(ci  ~ scores_raw_Santangelo, validation_corrected), auc_double(ci ~ scores_cor_Santangelo, validation_corrected)),
+      Conti_CI_H       = c(auc_double(ci  ~ scores_raw_Conti,      validation_corrected), auc_double(ci ~ scores_cor_Conti,      validation_corrected)),
+      Aiello_CI_H      = c(auc_double(ci  ~ scores_raw_Aiello,     validation_corrected), auc_double(ci ~ scores_cor_Aiello,     validation_corrected)),
+      # 1b: AUC for MCI_H = MCI vs. Healthy, after excluding dementia patients (realistic screening setting)
+      Santangelo_MCI_H = c(auc_double(mci ~ scores_raw_Santangelo, validation_nondem), auc_double(mci ~ scores_cor_Santangelo, validation_nondem)),
+      Conti_MCI_H      = c(auc_double(mci ~ scores_raw_Conti,      validation_nondem), auc_double(mci ~ scores_cor_Conti,      validation_nondem)),
+      Aiello_MCI_H     = c(auc_double(mci ~ scores_raw_Aiello,     validation_nondem), auc_double(mci ~ scores_cor_Aiello,     validation_nondem)),
+      # 1c: AUC for DEM_H = Dementia vs. Healthy, after excluding MCI patients (academic)
+      Santangelo_DEM_H = c(auc_double(dem ~ scores_raw_Santangelo, validation_nonmci), auc_double(dem ~ scores_cor_Santangelo, validation_nonmci)),
+      Conti_DEM_H      = c(auc_double(dem ~ scores_raw_Conti,      validation_nonmci), auc_double(dem ~ scores_cor_Conti,      validation_nonmci)),
+      Aiello_DEM_H     = c(auc_double(dem ~ scores_raw_Aiello,     validation_nonmci), auc_double(dem ~ scores_cor_Aiello,     validation_nonmci)))
+
+    # 2nd evaluation: Sens/Spec for MCI_H = MCI vs. Healthy, after excluding dementia patients (realistic)
+    sens_spec_raw_corrected <- data.frame()
+    samples_dev_healthy <- development_corrected %>% filter(healthy)
+    samples_dev_mci     <- development_corrected %>% filter(mci)
+    for (i_cutoff in 1:nrow(sens_spec_cutoffs)) {
+      cutoff_value <- sens_spec_cutoffs[i_cutoff, "value"]
+      if (sens_spec_cutoffs[i_cutoff, "sens_or_spec"] == "Specificity") {
+        all_cutoffs <- samples_dev_healthy %>% reframe(across(starts_with("scores_"), ~quantile(.x, 1.0 - cutoff_value)))
+      } else {
+        all_cutoffs <- samples_dev_mci     %>% reframe(across(starts_with("scores_"), ~quantile(.x, cutoff_value)))
+      }
+      tp_tn_fp_fn <- validation_nondem %>%
+        mutate(across(starts_with("scores_"), ~is_tp_tn_fp_fn(.x <= pull(all_cutoffs, cur_column()), mci)))
+      sens_spec_age_edu <- tp_tn_fp_fn %>%
+        group_by(age_group, edu) %>%
+        reframe(sens_raw_Santangelo = sens(scores_raw_Santangelo), sens_raw_Conti = sens(scores_raw_Conti), sens_raw_Aiello = sens(scores_raw_Aiello),
+                spec_raw_Santangelo = spec(scores_raw_Santangelo), spec_raw_Conti = spec(scores_raw_Conti), spec_raw_Aiello = spec(scores_raw_Aiello),
+                sens_cor_Santangelo = sens(scores_cor_Santangelo), sens_cor_Conti = sens(scores_cor_Conti), sens_cor_Aiello = sens(scores_cor_Aiello),
+                spec_cor_Santangelo = spec(scores_cor_Santangelo), spec_cor_Conti = spec(scores_cor_Conti), spec_cor_Aiello = spec(scores_cor_Aiello)) %>%
+        mutate(cutoff = sens_spec_cutoffs[i_cutoff, "label"]) %>%
+        select(starts_with(c("age_group", "edu", "spec", "sens", "cutoff")))
+      sens_spec_total <- tp_tn_fp_fn %>%
+        reframe(sens_raw_Santangelo = sens(scores_raw_Santangelo), sens_raw_Conti = sens(scores_raw_Conti), sens_raw_Aiello = sens(scores_raw_Aiello),
+                spec_raw_Santangelo = spec(scores_raw_Santangelo), spec_raw_Conti = spec(scores_raw_Conti), spec_raw_Aiello = spec(scores_raw_Aiello),
+                sens_cor_Santangelo = sens(scores_cor_Santangelo), sens_cor_Conti = sens(scores_cor_Conti), sens_cor_Aiello = sens(scores_cor_Aiello),
+                spec_cor_Santangelo = spec(scores_cor_Santangelo), spec_cor_Conti = spec(scores_cor_Conti), spec_cor_Aiello = spec(scores_cor_Aiello)) %>%
+        mutate(cutoff = sens_spec_cutoffs[i_cutoff, "label"], age_group = "Total", edu = 0) %>%
+        select(starts_with(c("age_group", "edu", "spec", "sens", "cutoff")))
+      sens_spec_raw_corrected <- rbind(sens_spec_raw_corrected, sens_spec_age_edu, sens_spec_total) 
+    }
+
+    # results over simulations are aggregated by foreach (rbind)
+    list(auc, sens_spec_raw_corrected)
+  }
+
+  # 1st evaluation: AUC mean and 95% confidence intervals across simulation runs
+  auc <- bind_rows(simulation_results[,1]) %>%
+    group_by(Scores) %>%
+    reframe(across(everything(), ~sprintf("%.4f [%.3f,%.3f]", mean(.x), quantile(.x, 0.025), quantile(.x, 0.975)))) %>%
+    rbind(expected_auc, .)
+  save_csv(auc, file = "../Processed/Simulation_Results_AUC.csv")
+
+  # 2nd evaluation: mean and 95% confidence intervals for sensitivity and specificity, for each age-education box, and for the totals
+  sens_spec <- rbind(bind_rows(simulation_results[,2])) %>%
+    mutate(across(starts_with("s"), ~ifelse(is.nan(.x), NA, .x))) %>%
+    group_by(cutoff, age_group, edu) %>%
+    reframe(across(starts_with("s"), ~sprintf("%#.1f [%#.1f,%#.1f]",
+      100.0 * mean(.x, na.rm = TRUE), 100.0 * quantile(.x, 0.025, na.rm = TRUE), 100.0 * quantile(.x, 0.975, na.rm = TRUE))))
+  save_csv(sens_spec, file = "../Processed/Simulation_Results_Sens_Spec.csv")
+
+  # aggregate sens/spec total and corner cases
+  sens_spec_total   <- sens_spec %>%
+    filter(age_group == "Total") %>%
+    mutate(age_group = "*", edu = "*") %>%
+    select(age_group, edu, starts_with(c("s", "Cutoff"))) %>% arrange(desc(cutoff))
+  sens_spec_corners <- sens_spec %>%
+    filter((age_group == "(54,59]" & edu == 17) | (age_group == "(84,89]" & edu == 5)) %>%
+    select(age_group, edu, starts_with(c("s", "Cutoff"))) %>% arrange(desc(cutoff), desc(edu))
+  sens_spec_print <- rbind(sens_spec_total, sens_spec_corners)
+  sens_spec_plot  <- sens_spec %>%
+    filter(age_group != "Total") %>%
+    select(age_group, edu, starts_with(c("s", "Cutoff"))) %>% arrange(desc(cutoff), desc(edu)) %>%
+    mutate(age_from  = as.integer(gsub(",.*", "", str_sub(age_group, 2, -1))) + 1, # extract "(...," and add 1
+           age_to    = as.integer(str_sub(gsub(".*,", "", age_group), 1, -2)),     # extract ",...]"
+           age_label = sprintf("%d-%d", age_from, age_to))
+```
+
+# Results
+
+```{r results, fig.width = 8, fig.height = 8}
+  # prepare ticks and tick labels for results plot, create horizontal lines to add to select panels
+  x_ticks <- seq(pop_age_min, pop_age_max, 5)
+  x_tick_labels <- sprintf("%d-%d", x_ticks, x_ticks + 4)
+  h_lines <- data.frame(cutoff    = c(sprintf("Cutoff for marginal sensitivity = %.1f %%", 100.0 * cutoff_sens),
+                                      sprintf("Cutoff for marginal specificity = %.1f %%", 100.0 * cutoff_spec_low)),
+                        sens_spec = c("Sensitivity [%]", "Specificity [%]"),
+                        y         = c(100.0 * cutoff_sens, 100.0 * cutoff_spec_low))
+
+  # create one plot with four panels to show sensitivity and specificity as functions of prevalence
+  figure_1 <- sens_spec_plot %>% filter(cutoff == "Spec = 84.1 %" | cutoff == "Sens = 84.1 %") %>%  # ignore highest specificity cutoff
+    select(age_group, age_from, edu, cutoff, ends_with("Aiello")) %>%                   # use Aiello model from Equation [1]
+    mutate(across(starts_with("s"), ~as.double(gsub(" .*", "", .x)))) %>%               # use mean value from "mean [x, y]" string
+    left_join(., pop_healthy_mci, by = c("age_group", "edu")) %>%                       # percentage of healthy individuals and MCI patients by age-edu group
+    pivot_longer(ends_with("Aiello")) %>% mutate(sens_spec = str_sub(name, 1, 4), type = str_sub(name, 6, 8)) %>% select(!name) %>% 
+    pivot_wider(names_from = "type", values_from = "value") %>%                         # move raw/corrected into different columns
+    mutate(sens_spec = str_replace_all(sens_spec, c("spec" = "Specificity [%]", "sens" = "Sensitivity [%]"))) %>% # use full word labels
+    mutate(cutoff = str_replace_all(cutoff, c("Spec" = "Cutoff for marginal specificity", "Sens" = "Cutoff for marginal sensitivity"))) %>%
+    mutate(resize = ifelse(sens_spec == "Specificity [%]", healthy, mci)) %>%           # scale symbols by percent of cases (sens) or healthy individuals (spec)
+    mutate(edu = factor(edu)) %>%
+    ggplot(aes(x = age_from, group_by = edu, color = edu, size = resize)) +
+      geom_point(aes(y = raw), shape = 15) +
+      geom_point(aes(y = cor), shape =  0) +
+      scale_x_continuous(breaks = x_ticks, labels = x_tick_labels) +
+      scale_y_continuous(breaks = seq(30, 100, 10)) +
+      labs(x = "Age [years]", y = "",
+           size  = "Fraction of MCI patients (sensitivity) / of healthy indivituals (specificity) [%]: ",
+           color = "Completed education [years]: ",
+           title = "Figure 1: Sensitivity and specificity for each age-education group, from main analysis.") +
+      theme(legend.position = "top", legend.box = "vertical", legend.key.size = unit(0.5, "cm"), legend.spacing.y = unit(-0.1, "cm"), panel.grid.minor = element_blank()) +
+      geom_hline(data = h_lines, aes(yintercept = y), color = "gray50") +
+    facet_grid(sens_spec ~ cutoff, switch = "y")
+  plot_pdf(figure_1, "../Plots/Fig1.pdf", width = 7, height = 5)
+
+  # pretty print all results
+  pretty_print_auc(auc, "Aiello",     n_simulation_runs)
+  pretty_print_auc(auc, "Conti",      n_simulation_runs)
+  pretty_print_auc(auc, "Santangelo", n_simulation_runs)
+  pretty_print_sens_spec(sens_spec_print, "Aiello",     n_simulation_runs)
+  pretty_print_sens_spec(sens_spec_print, "Conti",      n_simulation_runs)
+  pretty_print_sens_spec(sens_spec_print, "Santangelo", n_simulation_runs)
+```
